@@ -1,4 +1,5 @@
 {
+  "voice": "male",
   "rules": [
     {
       "from": "08:00",
@@ -9,7 +10,7 @@
     {
       "from": "13:00",
       "to": "",
-      "every_minutes": 1,
+      "every_minutes": "",
       "reason": "ארוחת צהריים"
     }
   ]

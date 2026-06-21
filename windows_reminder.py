@@ -12,6 +12,9 @@ from tkinter import font as tkfont
 from tkinter import ttk
 import datetime
 import json
+import os
+import shutil
+import sys
 import winsound
 from pathlib import Path
 from PIL import Image, ImageTk
@@ -22,7 +25,54 @@ GREEN_HOVER = "#94d3a2"
 MAGENTA = "#ff00ff"
 ALERT_TRANSP = "#010001"  # כרומה לפינות — לא מגנטה
 
-_POS_FILE = Path(__file__).with_name("windows_reminder_pos.json")
+
+def _is_frozen():
+    return getattr(sys, "frozen", False)
+
+
+def _user_data_dir():
+    if _is_frozen():
+        d = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "HealthReminder"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    return Path(__file__).parent
+
+
+def _resource_dir():
+    if _is_frozen():
+        return Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    return Path(__file__).parent
+
+
+DEFAULT_RULES = [
+    {"from": "08:00", "to": "18:00", "every_minutes": 120, "reason": "כושר גופני"},
+    {"from": "13:00", "to": "", "every_minutes": "", "reason": "ארוחת צהרים"},
+]
+DEFAULT_VOICE = "male"
+ACTIVITY_MSG = {
+    "male": "קום, מתח את הגוף ועשה קצת פעילות",
+    "female": "קומי, מתחי את הגוף ועשי קצת פעילות",
+}
+
+_POS_FILE = _user_data_dir() / "windows_reminder_pos.json"
+_SETTINGS_FILE = _user_data_dir() / "windows_reminder_settings.json"
+
+
+def _ensure_user_settings():
+    if _SETTINGS_FILE.exists():
+        return
+    bundled = _resource_dir() / "windows_reminder_settings.json"
+    try:
+        if bundled.exists():
+            shutil.copy(bundled, _SETTINGS_FILE)
+        else:
+            _SETTINGS_FILE.write_text(
+                json.dumps({"rules": [dict(r) for r in DEFAULT_RULES], "voice": DEFAULT_VOICE},
+                           ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+    except OSError:
+        pass
 
 
 def _load_position(default_x, default_y):
@@ -45,11 +95,6 @@ def _save_position():
 
 _settings = None
 _last_fired_slot = None
-_SETTINGS_FILE = Path(__file__).with_name("windows_reminder_settings.json")
-DEFAULT_RULES = [
-    {"from": "08:00", "to": "18:00", "every_minutes": 120, "reason": "כושר גופני"},
-    {"from": "13:00", "to": "", "every_minutes": "", "reason": "ארוחת צהרים"},
-]
 
 
 def _is_empty_field(text):
@@ -73,24 +118,60 @@ def _parse_hm(text):
     return datetime.time(int(h), int(m))
 
 
+def _normalize_settings(data):
+    voice = data.get("voice", DEFAULT_VOICE)
+    if voice not in ACTIVITY_MSG:
+        voice = DEFAULT_VOICE
+    rules = data.get("rules") or [dict(r) for r in DEFAULT_RULES]
+    return {
+        "voice": voice,
+        "rules": [_normalize_rule(r) for r in rules],
+    }
+
+
 def load_settings():
     global _settings
+    _ensure_user_settings()
     try:
         data = json.loads(_SETTINGS_FILE.read_text(encoding="utf-8"))
-        if data.get("rules"):
-            _settings = {"rules": [_normalize_rule(r) for r in data["rules"]]}
-            return
+        _settings = _normalize_settings(data)
+        if data.get("voice") not in ACTIVITY_MSG:
+            save_settings()
+        return
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         pass
-    _settings = {"rules": [dict(r) for r in DEFAULT_RULES]}
+    _settings = _normalize_settings({})
+
+
+def _activity_message():
+    voice = (_settings or {}).get("voice", DEFAULT_VOICE)
+    return ACTIVITY_MSG.get(voice, ACTIVITY_MSG[DEFAULT_VOICE])
+
+
+def _set_voice(voice):
+    global _settings
+    if voice not in ACTIVITY_MSG:
+        return
+    if _settings is None:
+        load_settings()
+    _settings["voice"] = voice
+    save_settings()
 
 
 def save_settings():
+    if not _settings:
+        return
+    payload = {
+        "voice": _settings.get("voice", DEFAULT_VOICE),
+        "rules": _settings.get("rules", [dict(r) for r in DEFAULT_RULES]),
+    }
     try:
         _SETTINGS_FILE.write_text(
-            json.dumps(_settings, ensure_ascii=False, indent=2),
+            json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        _settings["voice"] = payload["voice"]
+        _settings["rules"] = payload["rules"]
     except OSError:
         pass
 
@@ -181,7 +262,7 @@ def update_status_display():
 
 
 def _load_run_icon(size, *names):
-    base = Path(__file__).parent
+    base = _resource_dir()
     if not names:
         names = ("run.png", "ran.png")
     for name in names:
@@ -297,7 +378,47 @@ def make_round_button(parent, text, command, suffix="", font=("Arial", 32, "bold
     return c
 
 
-def show_alert(reason=""):
+def _alert_context(now=None):
+    """שעה וסיבה להתראה — הכלל הפעיל עכשיו, או התזכורת הבאה."""
+    now = now or datetime.datetime.now()
+    rule = _rule_at(now)
+    if rule:
+        t = now.replace(second=0, microsecond=0)
+        return t.strftime("%H:%M"), rule.get("reason", "")
+    dt = next_reminder_datetime(now)
+    dt_key = dt.replace(second=0, microsecond=0)
+    for slot, r in _all_slots(now.date()):
+        if slot.replace(second=0, microsecond=0) == dt_key:
+            return dt.strftime("%H:%M"), r.get("reason", "")
+    return dt.strftime("%H:%M"), ""
+
+
+def _alert_schedule_line(parent, time_part, reason_part, font, fg=MAGENTA, bg="#1e1e2e"):
+    """שורת 'בשעה HH:MM - סיבה' — מיקום ידני ללא bidi."""
+    fnt = tkfont.Font(font=font)
+    h = fnt.metrics("linespace") + 8
+    cy = h // 2
+    segments = []
+    if time_part and reason_part:
+        segments = ["\u200fבשעה", " ", f"\u200e{time_part}", " - ", f"\u200f{reason_part}"]
+    elif time_part:
+        segments = ["\u200fבשעה", " ", f"\u200e{time_part}"]
+    else:
+        segments = [f"\u200f{reason_part}"]
+    total_w = sum(fnt.measure(s) for s in segments)
+    wrap = tk.Frame(parent, bg=bg)
+    c = tk.Canvas(wrap, width=total_w, height=h, bg=bg, highlightthickness=0, bd=0)
+    c.pack()
+    x = total_w
+    for text in segments:
+        w = fnt.measure(text)
+        c.create_text(x, cy, text=text, anchor="e", font=font, fill=fg)
+        x -= w
+    wrap.pack(pady=(0, 8))
+    return wrap
+
+
+def show_alert(reason="", at_time=None):
     """חלון התראה גדול וברור שקופץ מעל הכל."""
     try:
         winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
@@ -328,26 +449,44 @@ def show_alert(reason=""):
     top = tk.Frame(body, bg="#1e1e2e")
     top.pack(side="top", fill="x", pady=(8, 0))
 
-    alert_icon = _load_run_icon(140)
+    alert_icon = _load_run_icon(168)
     icon_lbl = tk.Label(top, image=alert_icon, bg="#1e1e2e")
     icon_lbl.image = alert_icon
     icon_lbl.pack(pady=(0, 8))
 
-    if reason:
-        reason_font = ("Arial", 29, "bold")
-        tk.Label(top, text=f"\u200f{reason}", bg="#1e1e2e", fg=MAGENTA,
-                 font=reason_font).pack(pady=(0, 6))
+    if at_time is None or not (reason or "").strip():
+        ctx_time, ctx_reason = _alert_context()
+        if at_time is None:
+            at_time = ctx_time
+        if not (reason or "").strip():
+            reason = ctx_reason
+
+    time_part = (at_time or "").strip()
+    reason_part = (reason or "").strip()
+    if time_part or reason_part:
+        _alert_schedule_line(top, time_part, reason_part, ("Arial", 26, "bold"))
 
     title_row = tk.Frame(top, bg="#1e1e2e")
     title_font = ("Arial", 36, "bold")
-    tk.Label(title_row, text="\u200fזמן לקום מהכסא", bg="#1e1e2e", fg="#f38ba8",
-             font=title_font).pack(side="right")
-    tk.Label(title_row, text="!", bg="#1e1e2e", fg="#f38ba8",
-             font=title_font).pack(side="right")
+    title_lbl = tk.Label(title_row, text="\u200fזמן לקום מהכסא", bg="#1e1e2e", fg=GREEN,
+                         font=title_font)
+    title_lbl.pack(side="right")
+    bang_lbl = tk.Label(title_row, text="!", bg="#1e1e2e", fg=GREEN, font=title_font)
+    bang_lbl.pack(side="right")
     title_row.pack()
+
+    def _blink_title(on=True):
+        if not alert.winfo_exists():
+            return
+        fg = GREEN if on else "#1e1e2e"
+        title_lbl.config(fg=fg)
+        bang_lbl.config(fg=fg)
+        alert.after(550, lambda: _blink_title(not on))
+
+    alert.after(550, _blink_title)
     sub_row = tk.Frame(top, bg="#1e1e2e")
     sub_font = ("Arial", 22)
-    tk.Label(sub_row, text="\u200fקום, מתח את הגוף ועשה קצת פעילות", bg="#1e1e2e",
+    tk.Label(sub_row, text=f"\u200f{_activity_message()}", bg="#1e1e2e",
              fg="#cdd6f4", font=sub_font).pack(side="right")
     _thumbs = _load_run_icon(44, "windows_reminder_thumbsup.png")
     _thumb_lbl = tk.Label(sub_row, image=_thumbs, bg="#1e1e2e")
@@ -544,6 +683,66 @@ def _outline_button(parent, text, command, font=("Arial", 16), fg="#cdd6f4",
     return c
 
 
+def _segment_toggle(parent, variable, options, font=("Arial", 16), gap=8, on_change=None):
+    """כפתורי בחירה מעוגלים — RTL, בסגנון מסגרת תכלת."""
+    fr = tk.Frame(parent, bg="#1e1e2e")
+    fnt = tkfont.Font(font=font)
+    padx, ipady = 18, 7
+    bw = max(1, _dp(1))
+    th = fnt.metrics("linespace") + ipady * 2 + 4
+    r = _round_radius(th)
+    items = []
+
+    def _paint():
+        cur = variable.get()
+        for it in items:
+            on = it["value"] == cur
+            border = SKY if on else "#45475a"
+            fill = "#313244" if on else "#252536"
+            fg = SKY if on else "#cdd6f4"
+            c = it["canvas"]
+            c.itemconfig(it["border"], fill=border, outline=border)
+            c.itemconfig(it["inner"], fill=fill, outline=fill)
+            c.itemconfig(it["label"], fill=fg)
+
+    for label, value in options:
+        text = f"\u200f{label}"
+        tw = fnt.measure(text) + padx * 2
+        W, H = tw + bw * 2, th + bw * 2
+        c = tk.Canvas(fr, width=W, height=H, bg="#1e1e2e",
+                        highlightthickness=0, cursor="hand2", bd=0)
+        c.pack(side="right", padx=(gap, 0))
+        border_id = round_rect(c, 1, 1, W - 1, H - 1, r, fill="#45475a", outline="#45475a")
+        inner_id = round_rect(
+            c, 1 + bw, 1 + bw, W - 1 - bw, H - 1 - bw, max(1, r - bw),
+            fill="#252536", outline="#252536",
+        )
+        label_id = c.create_text(W // 2, H // 2, text=text, font=font, fill="#cdd6f4")
+        it = {"canvas": c, "border": border_id, "inner": inner_id,
+              "label": label_id, "value": value}
+
+        def _pick(_=None, v=value):
+            variable.set(v)
+            _paint()
+            if on_change:
+                on_change(v)
+
+        def _hover(on, item=it):
+            if variable.get() == item["value"]:
+                return
+            col = "#585b70" if on else "#45475a"
+            c.itemconfig(item["border"], fill=col, outline=col)
+
+        c.bind("<Button-1>", _pick)
+        c.bind("<Enter>", lambda e, item=it: _hover(True, item))
+        c.bind("<Leave>", lambda e, item=it: _hover(False, item))
+        items.append(it)
+
+    variable.trace_add("write", lambda *_: _paint())
+    _paint()
+    return fr
+
+
 def show_settings():
     """מסך הגדרות כללי תזכורת — בסגנון ווידג'ט השעון."""
     # 80% מהגודל שהיה (כפול × 0.8)
@@ -558,6 +757,8 @@ def show_settings():
     SET_W = max(720, 960 - _cm(5))
     PH = 672
     R = 20
+    _rules_right_pad = 4 + 11 + 6 + 2  # scrollbar + inset + card — יישור לימין עם מסגרת הכללים
+    _voice_left_nudge = 4  # הזזה עדינה שמאלה מיישור הכללים
 
     win = tk.Toplevel(root)
     win.title("הגדרות תזכורת")
@@ -583,21 +784,29 @@ def show_settings():
 
     hdr_row = tk.Frame(top_bar, bg="#1e1e2e")
     hdr_row.pack(fill="x")
-    close_lbl = tk.Label(hdr_row, text="✕", bg="#1e1e2e", fg=X_FG,
-                         font=X_FONT, cursor="hand2")
-    close_lbl.pack(side="left")
-    close_lbl.bind("<Button-1>", lambda e: win.destroy())
-    close_lbl.bind("<Enter>", lambda e: close_lbl.config(fg=X_HOVER))
-    close_lbl.bind("<Leave>", lambda e: close_lbl.config(fg=X_FG))
+    hdr_center = tk.Frame(hdr_row, bg="#1e1e2e")
+    hdr_center.pack(fill="x")
+    hdr_inner = tk.Frame(hdr_center, bg="#1e1e2e")
+    hdr_inner.pack(anchor="center", pady=2)
     try:
         hdr_icon = _load_run_icon(HDR_ICON)
-        icon_lbl = tk.Label(hdr_row, image=hdr_icon, bg="#1e1e2e")
+        icon_lbl = tk.Label(hdr_inner, image=hdr_icon, bg="#1e1e2e")
         icon_lbl.image = hdr_icon
-        icon_lbl.pack(side="right", padx=(12, 8))
+        icon_lbl.pack(side="right", padx=(4, 0))
     except FileNotFoundError:
         pass
-    tk.Label(hdr_row, text="כללי תזכורת", bg="#1e1e2e", fg=SKY,
-             font=("Arial", F_HDR, "bold")).pack(side="right", padx=(0, 4))
+    tk.Label(hdr_inner, text="כללי תזכורת", bg="#1e1e2e", fg=SKY,
+             font=("Arial", F_HDR, "bold")).pack(side="right")
+
+    voice_row = tk.Frame(body, bg="#1e1e2e")
+    voice_row.pack(fill="x", padx=12, pady=(6, 0))
+    voice_var = tk.StringVar(value=_settings.get("voice", DEFAULT_VOICE))
+    _segment_toggle(
+        voice_row, voice_var,
+        [("גבר", "male"), ("אשה", "female")],
+        font=("Arial", F_LABEL),
+        on_change=_set_voice,
+    ).pack(side="right", padx=(0, _rules_right_pad + _voice_left_nudge))
 
     scroll_wrap = tk.Frame(body, bg="#1e1e2e")
     scroll_wrap.pack(fill="both", expand=True, padx=12, pady=(8, 4))
@@ -623,8 +832,6 @@ def show_settings():
     frm = tk.Frame(rules_cv, bg="#1e1e2e")
     frm_id = rules_cv.create_window((0, 0), window=frm, anchor="nw")
     _scroll_inset = 6
-    _sb_col_w = 4 + 11  # padx + scrollbar width
-    _btn_add_right_pad = _sb_col_w + _scroll_inset + 2  # יישור עם מסגרת הכללים
 
     def _sync_frm_width():
         cv_w = rules_cv.winfo_width()
@@ -702,7 +909,7 @@ def show_settings():
         from_box.pack(side="right")
 
         rest = tk.Frame(row0, bg="#252536")
-        rest.pack(side="right")
+        rest.pack(side="right", padx=(0, 8))
         _rtl_label(rest, ["עד"], ("Arial", F_LABEL)).pack(side="right", pady=_entry_ipady)
         to_box, e_to = _field_entry(rest, ("Arial", F_ENTRY), chars=5, ltr=True)
         _insert_field(e_to, rule.get("to", ""), ltr=True)
@@ -744,7 +951,7 @@ def show_settings():
     btns = tk.Frame(body, bg="#1e1e2e")
     btns.pack(fill="x", padx=12, pady=(4, 10))
 
-    def do_save():
+    def _collect_rules():
         new_rules = []
         for r in rows:
             from_v = _field_value(r["from"], ltr=True)
@@ -771,19 +978,25 @@ def show_settings():
                     "every_minutes": every,
                     "reason": reason_v,
                 })
-        _settings["rules"] = new_rules or [dict(r) for r in DEFAULT_RULES]
+        return new_rules or [dict(r) for r in DEFAULT_RULES]
+
+    def _persist_settings():
+        global _settings
+        _settings["rules"] = _collect_rules()
+        _set_voice(voice_var.get())
         save_settings()
         update_status_display()
+
+    def _close_settings():
+        _persist_settings()
         win.destroy()
 
     def add_rule():
         add_row()
         _scroll_region()
 
-    btn_gap = _dp(12)
     btn_specs = [
-        ("\u200fביטול", ("Arial", F_BTN)),
-        ("\u200fשמור", ("Arial", F_BTN)),
+        ("\u200fיציאה", ("Arial", F_BTN)),
         ("\u200f+ הוסף כלל", ("Arial", F_BTN)),
     ]
     btn_padx, btn_ipady = 14, 7
@@ -794,13 +1007,11 @@ def show_settings():
         w = fm.measure(txt) + btn_padx * 2 + btn_bw * 2
         h = fm.metrics("linespace") + btn_ipady * 2 + 4 + btn_bw * 2
         btn_w, btn_h = max(btn_w, w), max(btn_h, h)
-    _outline_button(btns, btn_specs[0][0], win.destroy, font=btn_specs[0][1],
+    _outline_button(btns, btn_specs[0][0], _close_settings, font=btn_specs[0][1],
                     fg="#f38ba8", border="#f38ba8", width=btn_w, height=btn_h).pack(side="left")
-    _outline_button(btns, btn_specs[1][0], do_save, font=btn_specs[1][1],
-                    fg=GREEN, border=GREEN, width=btn_w, height=btn_h).pack(side="left", padx=btn_gap)
-    _outline_button(btns, btn_specs[2][0], add_rule, font=btn_specs[2][1],
+    _outline_button(btns, btn_specs[1][0], add_rule, font=btn_specs[1][1],
                     fg=SKY, border=SKY, width=btn_w, height=btn_h).pack(
-                        side="right", padx=(0, _btn_add_right_pad))
+                        side="right", padx=(0, _rules_right_pad))
 
 
 def tick():
@@ -811,7 +1022,7 @@ def tick():
     rule = _rule_at(now)
     if rule and _last_fired_slot != slot_key:
         _last_fired_slot = slot_key
-        show_alert(rule.get("reason", ""))
+        show_alert(rule.get("reason", ""), now.strftime("%H:%M"))
 
     update_status_display()
     root.after(1000, tick)
@@ -882,8 +1093,7 @@ canvas.create_text(W - 12, 16, text="▶", fill="#585b70",
                    font=("Roboto", 10), tags="test")
 
 canvas.tag_bind("close", "<Button-1>", lambda e: (_save_position(), root.destroy()))
-canvas.tag_bind("test", "<Button-1>", lambda e: show_alert(
-    _settings["rules"][0]["reason"] if _settings and _settings.get("rules") else ""))
+canvas.tag_bind("test", "<Button-1>", lambda e: show_alert())
 canvas.tag_bind("icon", "<Button-1>", lambda e: show_alert())
 canvas.tag_bind("clock", "<Button-1>", lambda e: show_settings())
 for tag in ("close", "test", "icon", "clock"):

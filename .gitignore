@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 windows_reminder_pos.json
+build/
+dist/
+HealthReminderSetup.exe
+tools/
